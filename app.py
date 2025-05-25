@@ -1,9 +1,13 @@
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 from confluent_kafka import Producer, Consumer, KafkaException
 from auth import authenticate, get_friends, get_user_groups, create_group
 from config import KAFKA_BROKER, BASE_TOPIC
+import base64
+from io import BytesIO
+from PIL import Image, ImageTk
+
 
 class ChatApplication:
     def __init__(self):
@@ -29,11 +33,7 @@ class ChatApplication:
         self.password_entry = ttk.Entry(main_frame, show="*")
         self.password_entry.pack(fill="x", pady=5)
         
-        ttk.Button(
-            main_frame, 
-            text="Se connecter", 
-            command=self.login
-        ).pack(pady=15)
+        ttk.Button(main_frame, text="Se connecter", command=self.login).pack(pady=15)
         
         self.login_root.mainloop()
 
@@ -71,12 +71,8 @@ class ChatApplication:
         contacts_tab = ttk.Frame(self.contacts_notebook)
         self.contacts_notebook.add(contacts_tab, text="Contacts")
         
-        groups_tab = ttk.Frame(self.contacts_notebook)
-        self.contacts_notebook.add(groups_tab, text="Groupes")
-        
         ttk.Label(contacts_tab, text="Contacts", font=("Helvetica", 12, "bold")).pack(pady=10)
         
-        # Frame intermédiaire pour la liste des contacts
         contacts_list_frame = ttk.Frame(contacts_tab)
         contacts_list_frame.pack(fill="both", expand=True, pady=5)
         
@@ -89,24 +85,23 @@ class ChatApplication:
             background="#f5f5f5",
             selectbackground="#e1e1e1",
             selectforeground="black",
-            relief="flat",
-            highlightcolor="#d9d9d9"
+            relief="flat"
         )
         self.contacts_list.pack(fill="both", expand=True, padx=5, pady=5)
         
-        # Ajout des contacts avec emojis et séparateurs
         friends = get_friends(self.username)
         for i, friend in enumerate(friends):
-            emojis = ["👤", "👩", "👨", "👧", "🧑"]  # Liste d'emojis
-            emoji = emojis[i % len(emojis)]  # Sélection cyclique
+            emojis = ["👤", "👩", "👨", "👧", "🧑"]
+            emoji = emojis[i % len(emojis)]
             self.contacts_list.insert(tk.END, f"{emoji} {friend}")
-            
-            # Ajouter un séparateur après chaque contact sauf le dernier
             if i < len(friends) - 1:
-                self.contacts_list.insert(tk.END, "─" * 20)  # Ligne de séparation
-                self.contacts_list.itemconfig(tk.END, fg="gray")  # Couleur grise pour le séparateur
+                self.contacts_list.insert(tk.END, "─" * 20)
+                self.contacts_list.itemconfig(tk.END, fg="gray")
         
         self.contacts_list.bind("<<ListboxSelect>>", lambda e: self.select_contact_or_group("contact"))
+        
+        groups_tab = ttk.Frame(self.contacts_notebook)
+        self.contacts_notebook.add(groups_tab, text="Groupes")
         
         ttk.Label(groups_tab, text="Groupes", font=("Helvetica", 12, "bold")).pack(pady=10)
         
@@ -128,8 +123,7 @@ class ChatApplication:
             background="#f5f5f5",
             selectbackground="#e1e1e1",
             selectforeground="black",
-            relief="flat",
-            highlightcolor="#d9d9d9"
+            relief="flat"
         )
         self.groups_list.pack(fill="both", expand=True, pady=5)
         
@@ -159,13 +153,26 @@ class ChatApplication:
             font=("Helvetica", 11),
             padx=10,
             pady=10,
-            yscrollcommand=scrollbar.set
+            yscrollcommand=scrollbar.set,
+            background="white"
         )
         self.message_display.pack(fill="both", expand=True)
         scrollbar.config(command=self.message_display.yview)
         
+        self.message_display.tag_config("sent", foreground="blue", justify="right")
+        self.message_display.tag_config("received", foreground="green", justify="left")
+        self.message_display.tag_config("sent_group", foreground="#5555FF", justify="right")
+        
         input_frame = ttk.Frame(chat_frame)
         input_frame.pack(fill="x", pady=10)
+        
+        self.image_button = ttk.Button(
+            input_frame,
+            text="📷",
+            command=self.select_and_send_image,
+            state="disabled"
+        )
+        self.image_button.pack(side="left", padx=5)
         
         self.message_input = ttk.Entry(
             input_frame,
@@ -202,7 +209,7 @@ class ChatApplication:
         self.root.after(5000, self.periodic_refresh)
 
     def refresh_groups_list(self):
-        """Met à jour la liste des groupes dans l'interface"""
+        """Met à jour la liste des groupes"""
         self.groups_list.delete(0, tk.END)
         for group in get_user_groups(self.username):
             self.groups_list.insert(tk.END, f"📢 {group}")
@@ -254,24 +261,20 @@ class ChatApplication:
     
     def select_contact_or_group(self, type_):
         """Gère la sélection d'un contact ou d'un groupe"""
-        if type_ == "contact":
-            widget = self.contacts_list
-        else:
-            widget = self.groups_list
+        widget = self.contacts_list if type_ == "contact" else self.groups_list
         
         selection = widget.curselection()
         if selection:
             selected = widget.get(selection[0])
-            # Ignorer les séparateurs
             if "─" not in selected:
                 if type_ == "group":
                     selected = selected.replace("📢 ", "")
                 elif type_ == "contact":
-                    selected = selected.split(" ")[1]  # Enlever l'emoji
+                    selected = selected.split(" ")[1]
                 self.start_chat(selected, type_)
 
     def start_chat(self, target, type_):
-        """Démarre une conversation sans historique"""
+        """Démarre une conversation"""
         self.current_chat = target
         self.current_chat_type = type_
         
@@ -286,6 +289,7 @@ class ChatApplication:
         
         self.message_input.config(state="normal")
         self.send_button.config(state="normal")
+        self.image_button.config(state="normal")
         
         if self.consumer_thread:
             self.running = False
@@ -300,7 +304,7 @@ class ChatApplication:
         self.consumer_thread.start()
 
     def send_message(self):
-        """Envoie un message sans sauvegarde"""
+        """Envoie un message texte"""
         message = self.message_input.get()
         if not message or not self.current_chat:
             return
@@ -316,10 +320,95 @@ class ChatApplication:
             topic = f"{BASE_TOPIC}-group-{self.current_chat}"
             full_message = f"[{self.current_chat}] {self.username}: {message}"
             producer.produce(topic, full_message.encode("utf-8"))
-            self.display_message(f"Vous (groupe): {message}", "sent")
+            self.display_message(f"Vous (groupe): {message}", "sent_group")
         
         producer.flush()
         self.message_input.delete(0, tk.END)
+
+    def select_and_send_image(self):
+        """Sélectionne et envoie une image"""
+        file_path = filedialog.askopenfilename(
+            title="Sélectionner une image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.bmp")]
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            img = Image.open(file_path)
+            img.thumbnail((400, 400))
+            
+            buffered = BytesIO()
+            img.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            
+            self.send_image(img_str)
+            
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Impossible d'envoyer l'image: {str(e)}")
+
+    def send_image(self, image_data):
+        """Envoie une image via Kafka"""
+        if not self.current_chat:
+            return
+        
+        producer = Producer({"bootstrap.servers": KAFKA_BROKER})
+        
+        self.display_image_message("Vous", image_data)
+        
+        if self.current_chat_type == "contact":
+            topic = f"{BASE_TOPIC}-{self.username}-{self.current_chat}"
+            message = f"IMAGE:{self.username}:{image_data}"
+            producer.produce(topic, message.encode("utf-8"))
+        else:
+            topic = f"{BASE_TOPIC}-group-{self.current_chat}"
+            message = f"GROUP_IMAGE:[{self.current_chat}] {self.username}:{image_data}"
+            producer.produce(topic, message.encode("utf-8"))
+        
+        producer.flush()
+
+    def display_image_message(self, sender, image_data):
+        """Affiche une image dans le chat"""
+        try:
+            img_data = base64.b64decode(image_data)
+            img = Image.open(BytesIO(img_data))
+            img.thumbnail((400, 400))
+            
+            photo = ImageTk.PhotoImage(img)
+            
+            self.message_display.config(state="normal")
+            
+            frame = tk.Frame(self.message_display, bd=0, relief="flat", bg="white")
+            
+            if sender != "Vous":
+                label = tk.Label(
+                    frame, 
+                    text=sender,
+                    font=("Helvetica", 9, "italic"),
+                    bg="white",
+                    fg="#666666"
+                )
+                label.pack(anchor="w", padx=5, pady=(5,0))
+            
+            label_img = tk.Label(
+                frame, 
+                image=photo, 
+                bd=1,
+                relief="solid",
+                bg="white"
+            )
+            label_img.image = photo
+            label_img.pack(padx=5, pady=5)
+            
+            self.message_display.window_create(tk.END, window=frame)
+            self.message_display.insert(tk.END, "\n")
+            
+            self.message_display.config(state="disabled")
+            self.message_display.see(tk.END)
+            
+        except Exception as e:
+            self.display_message(f"{sender} a envoyé une image (erreur d'affichage)", "received")
 
     def receive_messages(self, target, type_):
         """Reçoit les messages du contact ou du groupe"""
@@ -340,22 +429,29 @@ class ChatApplication:
             
             if msg and not msg.error():
                 message = msg.value().decode("utf-8")
-                if not message.startswith(f"[{target}] {self.username}:") and not message.startswith(f"{self.username}:"):
+                
+                if message.startswith("IMAGE:"):
+                    _, sender, img_data = message.split(":", 2)
+                    if sender != self.username:
+                        self.display_image_message(sender, img_data)
+                elif message.startswith("GROUP_IMAGE:"):
+                    _, group_info, img_data = message.split(":", 2)
+                    if not group_info.startswith(f"[{target}] {self.username}"):
+                        sender = group_info.split(" ")[-1]
+                        self.display_image_message(f"{sender} (groupe)", img_data)
+                elif not message.startswith(f"[{target}] {self.username}:") and not message.startswith(f"{self.username}:"):
                     self.display_message(message, "received")
         
         consumer.close()
 
     def display_message(self, message, msg_type):
-        """Affiche un message dans la conversation"""
+        """Affiche un message texte dans le chat"""
         self.message_display.config(state="normal")
         
-        if msg_type == "sent":
-            tag = "sent_group" if self.current_chat_type == "group" else "sent"
-            self.message_display.insert(tk.END, message + "\n", tag)
-            self.message_display.tag_config(tag, foreground="blue", justify="right")
-        else:
-            self.message_display.insert(tk.END, message + "\n", "received")
-            self.message_display.tag_config("received", foreground="green", justify="left")
+        if not self.message_display.get("end-2c", "end-1c") == "\n":
+            self.message_display.insert(tk.END, "\n")
+        
+        self.message_display.insert(tk.END, message + "\n", msg_type)
         
         self.message_display.config(state="disabled")
         self.message_display.see(tk.END)
@@ -366,6 +462,7 @@ class ChatApplication:
         if self.consumer_thread:
             self.consumer_thread.join()
         self.root.destroy()
+
 
 if __name__ == "__main__":
     app = ChatApplication()
