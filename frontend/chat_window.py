@@ -1,53 +1,16 @@
-import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
-from confluent_kafka import Producer, Consumer, KafkaException
-from auth import authenticate, get_friends, get_user_groups, create_group
-from config import KAFKA_BROKER, BASE_TOPIC
+from backend.auth_manager import get_friends, get_user_groups, create_group
+from backend.kafka_manager import KafkaManager
 import base64
 from io import BytesIO
 from PIL import Image, ImageTk
 
-
-class ChatApplication:
-    def __init__(self):
-        self.setup_login_window()
-
-    def setup_login_window(self):
-        """Configure la fenêtre de connexion"""
-        self.login_root = tk.Tk()
-        self.login_root.title("Connexion au Chat")
-        self.login_root.geometry("350x250")
-        self.login_root.resizable(False, False)
-        
-        main_frame = ttk.Frame(self.login_root)
-        main_frame.pack(pady=20, padx=20, fill="both", expand=True)
-        
-        ttk.Label(main_frame, text="Chat Kafka", font=("Helvetica", 14, "bold")).pack(pady=10)
-        
-        ttk.Label(main_frame, text="Nom d'utilisateur:").pack(anchor="w")
-        self.username_entry = ttk.Entry(main_frame)
-        self.username_entry.pack(fill="x", pady=5)
-        
-        ttk.Label(main_frame, text="Mot de passe:").pack(anchor="w")
-        self.password_entry = ttk.Entry(main_frame, show="*")
-        self.password_entry.pack(fill="x", pady=5)
-        
-        ttk.Button(main_frame, text="Se connecter", command=self.login).pack(pady=15)
-        
-        self.login_root.mainloop()
-
-    def login(self):
-        """Gère le processus de connexion"""
-        username = self.username_entry.get()
-        password = self.password_entry.get()
-        
-        if authenticate(username, password):
-            self.login_root.destroy()
-            self.username = username
-            self.setup_chat_interface()
-        else:
-            messagebox.showerror("Erreur", "Identifiants incorrects")
+class ChatWindow:
+    def __init__(self, username):
+        self.username = username
+        self.kafka_manager = KafkaManager(username)
+        self.setup_chat_interface()
 
     def setup_chat_interface(self):
         """Configure l'interface de chat principale"""
@@ -191,8 +154,6 @@ class ChatApplication:
         
         self.current_chat = None
         self.current_chat_type = None
-        self.running = True
-        self.consumer_thread = None
         
         self.periodic_refresh()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -291,17 +252,11 @@ class ChatApplication:
         self.send_button.config(state="normal")
         self.image_button.config(state="normal")
         
-        if self.consumer_thread:
-            self.running = False
-            self.consumer_thread.join()
-        
-        self.running = True
-        self.consumer_thread = threading.Thread(
-            target=self.receive_messages,
-            args=(target, type_),
-            daemon=True
+        self.kafka_manager.start_consumer(
+            target, 
+            type_ == "group", 
+            self.handle_incoming_message
         )
-        self.consumer_thread.start()
 
     def send_message(self):
         """Envoie un message texte"""
@@ -309,20 +264,14 @@ class ChatApplication:
         if not message or not self.current_chat:
             return
         
-        producer = Producer({"bootstrap.servers": KAFKA_BROKER})
+        is_group = self.current_chat_type == "group"
+        self.kafka_manager.send_message(self.current_chat, message, is_group)
         
-        if self.current_chat_type == "contact":
-            topic = f"{BASE_TOPIC}-{self.username}-{self.current_chat}"
-            full_message = f"{self.username}: {message}"
-            producer.produce(topic, full_message.encode("utf-8"))
-            self.display_message(f"Vous: {message}", "sent")
-        else:
-            topic = f"{BASE_TOPIC}-group-{self.current_chat}"
-            full_message = f"[{self.current_chat}] {self.username}: {message}"
-            producer.produce(topic, full_message.encode("utf-8"))
+        if is_group:
             self.display_message(f"Vous (groupe): {message}", "sent_group")
+        else:
+            self.display_message(f"Vous: {message}", "sent")
         
-        producer.flush()
         self.message_input.delete(0, tk.END)
 
     def select_and_send_image(self):
@@ -343,30 +292,26 @@ class ChatApplication:
             img.save(buffered, format="PNG")
             img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
             
-            self.send_image(img_str)
+            is_group = self.current_chat_type == "group"
+            self.kafka_manager.send_image(self.current_chat, img_str, is_group)
+            self.display_image_message("Vous", img_str)
             
         except Exception as e:
             messagebox.showerror("Erreur", f"Impossible d'envoyer l'image: {str(e)}")
 
-    def send_image(self, image_data):
-        """Envoie une image via Kafka"""
-        if not self.current_chat:
-            return
-        
-        producer = Producer({"bootstrap.servers": KAFKA_BROKER})
-        
-        self.display_image_message("Vous", image_data)
-        
-        if self.current_chat_type == "contact":
-            topic = f"{BASE_TOPIC}-{self.username}-{self.current_chat}"
-            message = f"IMAGE:{self.username}:{image_data}"
-            producer.produce(topic, message.encode("utf-8"))
-        else:
-            topic = f"{BASE_TOPIC}-group-{self.current_chat}"
-            message = f"GROUP_IMAGE:[{self.current_chat}] {self.username}:{image_data}"
-            producer.produce(topic, message.encode("utf-8"))
-        
-        producer.flush()
+    def handle_incoming_message(self, message):
+        """Traite les messages entrants"""
+        if message.startswith("IMAGE:"):
+            _, sender, img_data = message.split(":", 2)
+            if sender != self.username:
+                self.display_image_message(sender, img_data)
+        elif message.startswith("GROUP_IMAGE:"):
+            _, group_info, img_data = message.split(":", 2)
+            if not group_info.startswith(f"[{self.current_chat}] {self.username}"):
+                sender = group_info.split(" ")[-1]
+                self.display_image_message(f"{sender} (groupe)", img_data)
+        elif not message.startswith(f"[{self.current_chat}] {self.username}:") and not message.startswith(f"{self.username}:"):
+            self.display_message(message, "received")
 
     def display_image_message(self, sender, image_data):
         """Affiche une image dans le chat"""
@@ -410,40 +355,6 @@ class ChatApplication:
         except Exception as e:
             self.display_message(f"{sender} a envoyé une image (erreur d'affichage)", "received")
 
-    def receive_messages(self, target, type_):
-        """Reçoit les messages du contact ou du groupe"""
-        if type_ == "contact":
-            topic = f"{BASE_TOPIC}-{target}-{self.username}"
-        else:
-            topic = f"{BASE_TOPIC}-group-{target}"
-        
-        consumer = Consumer({
-            "bootstrap.servers": KAFKA_BROKER,
-            "group.id": f"{self.username}-group",
-            "auto.offset.reset": "latest"
-        })
-        consumer.subscribe([topic])
-        
-        while self.running:
-            msg = consumer.poll(1.0)
-            
-            if msg and not msg.error():
-                message = msg.value().decode("utf-8")
-                
-                if message.startswith("IMAGE:"):
-                    _, sender, img_data = message.split(":", 2)
-                    if sender != self.username:
-                        self.display_image_message(sender, img_data)
-                elif message.startswith("GROUP_IMAGE:"):
-                    _, group_info, img_data = message.split(":", 2)
-                    if not group_info.startswith(f"[{target}] {self.username}"):
-                        sender = group_info.split(" ")[-1]
-                        self.display_image_message(f"{sender} (groupe)", img_data)
-                elif not message.startswith(f"[{target}] {self.username}:") and not message.startswith(f"{self.username}:"):
-                    self.display_message(message, "received")
-        
-        consumer.close()
-
     def display_message(self, message, msg_type):
         """Affiche un message texte dans le chat"""
         self.message_display.config(state="normal")
@@ -458,11 +369,5 @@ class ChatApplication:
 
     def on_closing(self):
         """Nettoyage avant fermeture"""
-        self.running = False
-        if self.consumer_thread:
-            self.consumer_thread.join()
+        self.kafka_manager.stop_consumer()
         self.root.destroy()
-
-
-if __name__ == "__main__":
-    app = ChatApplication()
